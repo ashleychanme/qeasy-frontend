@@ -1,9 +1,9 @@
 // src/App.tsx
-// Qeasy メイン画面 完成版（Step1〜4対応）
+// Qeasy メイン画面 完成版（カテゴリ自動判定＋Amazonリンク版）
 //
 // - Keepa ASIN CSV 読込
 // - Amazon情報・Qoo10既存チェック・出品API呼び出し
-// - Prime / 出品者数 / NGワード / 価格ルール / カテゴリ自動割当
+// - Prime / 出品者1人除外 / NGワード / 価格ルール / カテゴリ自動割当
 // - 出品結果をページ内ULで表示
 // - 設定 & 商品一覧: localStorage + /settings + /items 同期
 // - 「最新情報に更新」ボタンで /items/refresh と連携（定期バッチ結果をUIに反映）
@@ -31,6 +31,8 @@ import {
   type QeasyItem,
 } from "./api/qeasy";
 
+import { classifyQoo10Category } from "./qoo10Category";
+
 type Page = "list" | "settings" | "profile";
 
 type PriceRule = {
@@ -56,7 +58,6 @@ type Product = {
 };
 
 type SettingsState = {
-  sellerThreshold: number;
   primeOnly: boolean;
   primeShipDaysMax: number;
   maxStockPerItem: number;
@@ -94,7 +95,6 @@ const SETTINGS_KEY = "qeasy-settings-v3";
 const PRODUCTS_KEY = "qeasy-products-v3";
 
 const DEFAULT_SETTINGS: SettingsState = {
-  sellerThreshold: 3,
   primeOnly: true,
   primeShipDaysMax: 3,
   maxStockPerItem: 2,
@@ -188,36 +188,44 @@ const parseAsinCsv = (text: string): string[] => {
 };
 
 /* ========== カテゴリ自動割当 ========== */
-
-const AUTO_CATEGORY_RULES: { keywords: string[]; categoryNo: number }[] = [
-  { keywords: ["ヘナ", "ヘアカラー"], categoryNo: 120000 },
-  { keywords: ["シャンプー", "トリートメント"], categoryNo: 120000 },
-  { keywords: ["サプリ", "supplement", "ビタミン"], categoryNo: 130000 },
-  { keywords: ["コスメ", "化粧水", "美容液"], categoryNo: 110000 },
-  { keywords: ["ダイエット", "プロテイン"], categoryNo: 140000 },
-];
-
+/**
+ * 手動マップ → 自動推定（classifyQoo10Category）の順でカテゴリを決定。
+ * 戻り値は Qoo10 に渡す SecondSubCat の数値。
+ */
 const chooseCategory = (
   info: AmazonItemInfo | undefined,
   p: Product,
   settings: SettingsState
 ): number | undefined => {
-  const title = (info?.title || p.name || "").toLowerCase();
+  const rawTitle = info?.title || p.name || "";
+  const titleLower = rawTitle.toLowerCase();
 
+  // 1. 手動カテゴリマップ（キーワード → カテゴリNo）
   for (const [key, cat] of Object.entries(settings.categoryMap)) {
     if (!key) continue;
-    if (title.includes(key.toLowerCase())) return cat;
-  }
-
-  if (settings.autoCategoryEnabled) {
-    for (const rule of AUTO_CATEGORY_RULES) {
-      if (rule.keywords.some((kw) => kw && title.includes(kw.toLowerCase()))) {
-        return rule.categoryNo;
-      }
+    if (titleLower.includes(key.toLowerCase())) {
+      return cat;
     }
   }
 
-  return undefined;
+  // 2. 自動判定を使わない設定ならここまで
+  if (!settings.autoCategoryEnabled) {
+    return undefined;
+  }
+
+  // 3. ビューティ系細分けを含む自動推定
+  const decision = classifyQoo10Category(rawTitle);
+
+  if (!decision) return undefined;
+
+  if (decision.main === "120000") {
+    // ビューティは beautySecondSubCat を SecondSubCat として使う
+    const sub = decision.beautySecondSubCat ?? "120000012";
+    return Number(sub);
+  }
+
+  // サプリ／美容家電／日用品などは main をそのまま SecondSubCat として扱う
+  return Number(decision.main);
 };
 
 /* ========== QeasyItem → Product マッピング ========== */
@@ -525,17 +533,17 @@ const App: React.FC = () => {
     if (refreshing) return;
     setRefreshing(true);
     try {
-      // サーバ側で定期バッチ or 即時計算を走らせる
       await refreshItems().catch(() => {});
-      // 更新後の /items を取得
       const remote = await fetchItems();
       if (remote && remote.length) {
         setProducts(mapItemsToProducts(remote));
-        setListingResults(null); // 過去結果はいったんクリアしておく
+        setListingResults(null);
       }
     } catch (e) {
       console.error(e);
-      alert("最新情報の取得に失敗しました。server.mjs / qeasy-api を確認してください。");
+      alert(
+        "最新情報の取得に失敗しました。server.mjs / qeasy-api を確認してください。"
+      );
     } finally {
       setRefreshing(false);
     }
@@ -702,6 +710,7 @@ const App: React.FC = () => {
           continue;
         }
 
+        // Prime条件
         if (settings.primeOnly) {
           if (
             info.isPrime === false ||
@@ -720,12 +729,13 @@ const App: React.FC = () => {
           }
         }
 
-        if (info.sellerCount < settings.sellerThreshold) {
+        // 出品者1人以下は除外（固定ルール）
+        if (info.sellerCount != null && info.sellerCount <= 1) {
           results.push({
             asin: p.asin,
             name: p.name,
             status: "forbidden",
-            message: `出品者数が閾値(${settings.sellerThreshold})未満のため除外 (${info.sellerCount}人)。`,
+            message: `出品者が1人のみのため除外しました。（${info.sellerCount}人）`,
           });
           continue;
         }
@@ -766,7 +776,10 @@ const App: React.FC = () => {
           continue;
         }
 
-        const title = stripWords(info.title || p.name, settings.nameEraseWords);
+        const title = stripWords(
+          info.title || p.name,
+          settings.nameEraseWords
+        );
         const price = applyRule(info.price, settings.rules);
         if (!price || price <= 0) {
           results.push({
@@ -785,16 +798,15 @@ const App: React.FC = () => {
             : 1;
 
         payloads.push({
-  asin: p.asin,
-  price,
-  shippingCode: settings.shippingCode,
-  title,
-  imageUrl: info.image,
-  categoryNo,
-  stock,
-  jan: p.jan, // ★追加
-});
-
+          asin: p.asin,
+          price,
+          shippingCode: settings.shippingCode,
+          title,
+          imageUrl: info.image,
+          categoryNo,
+          stock,
+          jan: p.jan, // JAN をそのままAPIに渡す
+        });
       }
 
       if (!payloads.length) {
@@ -974,6 +986,7 @@ const App: React.FC = () => {
                     p.inStock === false
                       ? 0
                       : applyRule(p.amazonPrice, settings.rules);
+                  const amazonUrl = `https://www.amazon.co.jp/dp/${p.asin}`;
                   return (
                     <tr key={p.id}>
                       <td className="checkbox-cell">
@@ -986,23 +999,38 @@ const App: React.FC = () => {
                         />
                       </td>
                       <td className="cell-center">
-                        <div className="thumb-wrap">
-                          <img
-                            className="thumb-main"
-                            src={p.mainImage}
-                            alt=""
-                          />
-                          {p.images?.slice(0, 2).map((u, idx) => (
+                        <a
+                          href={amazonUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          <div className="thumb-wrap">
                             <img
-                              key={idx}
-                              className="thumb-sub"
-                              src={u}
-                              alt=""
+                              className="thumb-main"
+                              src={p.mainImage}
+                              alt={p.name}
                             />
-                          ))}
-                        </div>
+                            {p.images?.slice(0, 2).map((u, idx) => (
+                              <img
+                                key={idx}
+                                className="thumb-sub"
+                                src={u}
+                                alt={p.name}
+                              />
+                            ))}
+                          </div>
+                        </a>
                       </td>
-                      <td className="cell-name">{p.name}</td>
+                      <td className="cell-name">
+                        <a
+                          href={amazonUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="link-amazon"
+                        >
+                          {p.name}
+                        </a>
+                      </td>
                       <td className="cell-center">{p.asin}</td>
                       <td className="cell-center">{p.jan || "-"}</td>
                       <td className="cell-center">{p.qoo10Id || "-"}</td>
@@ -1044,19 +1072,12 @@ const App: React.FC = () => {
           <div className="section-title">基本設定</div>
           <div className="settings-grid">
             <div className="settings-card">
-              <div className="settings-label">出品者数 閾値</div>
-              <input
-                className="settings-input"
-                type="number"
-                min={0}
-                value={settings.sellerThreshold}
-                onChange={(e) =>
-                  setSettings((s) => ({
-                    ...s,
-                    sellerThreshold: Number(e.target.value) || 0,
-                  }))
-                }
-              />
+              <div className="settings-label">出品者数条件</div>
+              <div className="note">
+                Amazon の出品者が<strong>1人のみ</strong>の商品は、
+                知的財産権リスク回避のため自動的に除外します。
+                （このルールは固定で変更できません）
+              </div>
             </div>
             <div className="settings-card">
               <div className="settings-label">送料コード</div>
